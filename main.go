@@ -1,19 +1,20 @@
 package main
 
-import "errors"
-import "flag"
-import "fmt"
-import "io/ioutil"
-import "log"
-import "net"
-import "net/http"
-import "os"
-import "time"
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"time"
 
-import "github.com/prasmussen/gandi-api/client"
-import "github.com/prasmussen/gandi-api/domain/zone"
-import "github.com/prasmussen/gandi-api/domain/zone/record"
-import "github.com/prasmussen/gandi-api/domain/zone/version"
+	"github.com/prasmussen/gandi-api/client"
+	"github.com/prasmussen/gandi-api/domain/zone"
+	"github.com/prasmussen/gandi-api/domain/zone/record"
+	"github.com/prasmussen/gandi-api/domain/zone/version"
+)
 
 var (
 	apiKey       string
@@ -34,20 +35,16 @@ func init() {
 
 // Returns the public IP address
 func getPublicIP4() (string, error) {
-	res, err := http.Get("http://api.externalip.net/ip/")
+	output, err := exec.Command("dig", "+short", "myip.opendns.com", "@resolver1.opendns.com").Output()
 	if err != nil {
 		return "", err
 	}
-	defer res.Body.Close()
-	data, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return "", err
-	}
-	ip := net.ParseIP(string(data))
+	stringIP := string(output[0 : len(output)-1]) //output has a trailing newline
+	ip := net.ParseIP(stringIP)
 	if ip == nil || ip.To4() == nil {
 		return "", errors.New("no ipv4 valid address")
 	}
-	return ip.String(), nil
+	return stringIP, nil
 }
 
 // Delete a version of a DNS zone

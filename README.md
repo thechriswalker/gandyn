@@ -1,3 +1,7 @@
+> forked from yalp/gandyn
+>
+> changed public IP check to opendns `myip.opendns.com` query via dig (yes, *nix only)
+
 ## Overview 
 
 A dynamic IP updater for Gandi.
