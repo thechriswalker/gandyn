@@ -22,6 +22,8 @@ var (
 	zoneId       int64
 	recordName   string
 	refresh      time.Duration
+	resolver     string
+	hostname     string
 )
 
 // Define and parse flags
@@ -31,13 +33,19 @@ func init() {
 	flag.Int64Var(&zoneId, "zone", 0, "Mandatory. Zone id")
 	flag.StringVar(&recordName, "record", "", "Mandatory. Record to update")
 	flag.DurationVar(&refresh, "refresh", 5*time.Minute, "Delay between checks for public IP address updates")
+	flag.StringVar(&resolver, "resolver", "resolver1.opendns.com", "The resolver to check use for `myip` record")
+	flag.StringVar(&hostname, "myip", "myip.opendns.com", "The hostname of the record to use to check for current IP")
 }
 
 // Returns the public IP address
 func getPublicIP4() (string, error) {
-	output, err := exec.Command("dig", "+short", "myip.opendns.com", "@resolver1.opendns.com").Output()
+	output, err := exec.Command("dig", "+time=1", "+short", hostname, "@"+resolver).Output()
 	if err != nil {
 		return "", err
+	}
+	if len(output) == 0 {
+		//fail.
+		return "", errors.New("no ipv4 valid address")
 	}
 	stringIP := string(output[0 : len(output)-1]) //output has a trailing newline
 	ip := net.ParseIP(stringIP)
