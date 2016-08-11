@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
@@ -134,19 +135,37 @@ func main() {
 		platform = client.Testing
 	}
 
+	//if we try to make a request before there is internet connectivity it will hang indefinitely.
+	//this is bad as this starts before my PPP connection is up.
+	//so we wait.
+	endpoint := platform.Url()
+	for {
+		//the default http.Get has a 30 second timeout.
+		if res, err := http.Get(endpoint); err == nil {
+			//OK that's what I hoped for
+			res.Close = true
+			res.Body.Close()
+			break
+		}
+		//otherwise wait and try again
+		fmt.Println("Warn: no outbound internet access, waiting to try again")
+		time.Sleep(30 * time.Second)
+	}
+
 	// Get the active version of the zone
 	client := client.New(apiKey, platform)
 	zoneInfo, err := zone.New(client).Info(zoneId)
 	if err != nil {
-		log.Println("Error: could not get current version:", err)
+		log.Println("Error: could not get current zone version:", err)
 		return
 	}
+
 	activeVersion := zoneInfo.Version
 
 	// Get registered ip address
 	recordInfo, err := getRecord(client, zoneId, activeVersion, recordName)
 	if err != nil {
-		log.Println("Error: could not get current record:", err)
+		log.Println("Error: could not get current record info:", err)
 		return
 	}
 	registeredIp := recordInfo.Value
