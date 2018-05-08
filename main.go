@@ -1,46 +1,51 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"time"
-
-	"github.com/prasmussen/gandi-api/client"
-	"github.com/prasmussen/gandi-api/domain/zone"
-	"github.com/prasmussen/gandi-api/domain/zone/record"
-	"github.com/prasmussen/gandi-api/domain/zone/version"
 )
 
 var (
-	apiKey       string
-	testPlatform bool
-	zoneId       int64
-	recordName   string
-	refresh      time.Duration
-	resolver     string
-	hostname     string
+	apiKey     string
+	zoneID     string
+	recordName string
+	refresh    time.Duration
+	resolver   string
+	hostname   string
+)
+
+const (
+	baseURL = "https://dns.api.gandi.net/api/v5/zones"
 )
 
 // Define and parse flags
 func init() {
 	flag.StringVar(&apiKey, "apikey", "", "Mandatory. API key to access server platform")
-	flag.BoolVar(&testPlatform, "test", false, "Perform queries against test platform (OT&E) instead of production platform")
-	flag.Int64Var(&zoneId, "zone", 0, "Mandatory. Zone id")
+	flag.StringVar(&zoneID, "zone", "", "Mandatory. Zone uuid")
 	flag.StringVar(&recordName, "record", "", "Mandatory. Record to update")
 	flag.DurationVar(&refresh, "refresh", 5*time.Minute, "Delay between checks for public IP address updates")
 	flag.StringVar(&resolver, "resolver", "resolver1.opendns.com", "The resolver to check use for `myip` record")
 	flag.StringVar(&hostname, "myip", "myip.opendns.com", "The hostname of the record to use to check for current IP")
 }
 
-// Returns the public IP address
-func getPublicIP4() (string, error) {
-	output, err := exec.Command("dig", "+time=1", "+short", hostname, "@"+resolver).Output()
+type publicIPResolver struct {
+	Hostname string
+	Server   string
+}
+
+// Resolve gets the current pblic IP
+func (p *publicIPResolver) Resolve() (string, error) {
+	output, err := exec.Command("dig", "+time=1", "+short", p.Hostname, "@"+p.Server).Output()
 	if err != nil {
 		return "", err
 	}
@@ -56,135 +61,120 @@ func getPublicIP4() (string, error) {
 	return stringIP, nil
 }
 
-// Delete a version of a DNS zone
-func deleteVersion(client *client.Client, zoneId, versionId int64) {
-	if _, err := version.New(client).Delete(zoneId, versionId); err != nil {
-		log.Println("Warning: failed to delete version", versionId, ":", err)
-	}
+type liveDNSRecord struct {
+	Kind   string   `json:"rrset_type,omitempty"`
+	Name   string   `json:"rrset_name,omitempty"`
+	TTL    uint     `json:"rrset_ttl,omitempty"`
+	Values []string `json:"rrset_values,omitempty"`
 }
 
-// Get the RecordInfo of a version of a DNS zone
-func getRecord(client *client.Client, zoneId, versionId int64, recordName string) (*record.RecordInfo, error) {
-	records, err := record.New(client).List(zoneId, versionId)
+type liveDNSConfig struct {
+	Key    string
+	Zone   string
+	Record string
+}
+
+func (l *liveDNSConfig) req(method string, body io.Reader) (*http.Response, error) {
+	url := fmt.Sprintf("%s/%s/records/%s/A", baseURL, l.Zone, l.Record)
+	//log.Println(url)
+	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range records {
-		if r.Name == recordName {
-			return r, nil
-		}
-	}
-	return nil, errors.New("record not found")
+
+	req.Header.Set("X-Api-Key", l.Key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	return http.DefaultClient.Do(req)
 }
 
-// Update the record using the provided RecordInfo.
-// A new version of the zone will be created and activated.
-func updateRecord(client *client.Client, zoneId, versionId int64, r *record.RecordInfo) (int64, error) {
-	updateFailed := errors.New("update failed")
-	// Copy current version as a new one
-	newVersion, err := version.New(client).New(zoneId, versionId)
+// Get gets the Current value of the record
+func (l *liveDNSConfig) Get() (string, error) {
+	res, err := l.req("GET", nil)
 	if err != nil {
-		log.Println("Error: failed to create new version:", err)
-		return 0, updateFailed
+		return "", err
 	}
-	// Get the previous record in the new version
-	oldRecord, err := getRecord(client, zoneId, newVersion, r.Name)
+	record := &liveDNSRecord{}
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(record); err != nil {
+		return "", err
+	}
+	if record.Values == nil || len(record.Values) == 0 || record.Values[0] == "" {
+		//log.Println(record)
+		return "", errors.New("Invalid Record Response")
+	}
+	return record.Values[0], nil
+}
+
+// Set sets the value of the Record
+func (l *liveDNSConfig) Set(ip string) error {
+	body := &bytes.Buffer{}
+	err := json.NewEncoder(body).Encode(&liveDNSRecord{TTL: 300, Values: []string{ip}})
 	if err != nil {
-		log.Print("Error: failed to get old record:", err)
-		// Rollback new version creation
-		deleteVersion(client, zoneId, newVersion)
-		return 0, updateFailed
+		return err
 	}
-	// Delete previous record in this new version
-	if ok, err := record.New(client).Delete(zoneId, newVersion, oldRecord.Id); !ok {
-		log.Print("Error: failed to delete previous record:", err)
-		// Rollback new version creation
-		deleteVersion(client, zoneId, newVersion)
-		return 0, updateFailed
+	res, err := l.req("PUT", body)
+	if err != nil {
+		return err
 	}
-	// Add updated record
-	recordAdd := record.RecordAdd{zoneId, newVersion, r.Name, r.Type, r.Value, r.Ttl}
-	if _, err := record.New(client).Add(recordAdd); err != nil {
-		log.Print("Error: failed to add updated record:", err)
-		// Rollback new version creation
-		deleteVersion(client, zoneId, newVersion)
-		return 0, updateFailed
+
+	// we should get a created code
+	if res.StatusCode != http.StatusCreated {
+		return fmt.Errorf("Unexpected Response Status Code [%d]", res.StatusCode)
 	}
-	// Activate new version
-	if _, err := version.New(client).Set(zoneId, newVersion); err != nil {
-		log.Println("Error: failed to activate updated version:", err)
-		// Rollback new version creation
-		deleteVersion(client, zoneId, newVersion)
-		return 0, updateFailed
-	}
-	// Delete old version
-	deleteVersion(client, zoneId, versionId)
-	return newVersion, nil
+	return nil
 }
 
 func main() {
 	flag.Parse()
-	if apiKey == "" || recordName == "" || zoneId == 0 {
+	if apiKey == "" || recordName == "" || zoneID == "" {
 		fmt.Println("Missing one or more command line options.")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 
-	platform := client.Production
-	if testPlatform {
-		platform = client.Testing
+	dyndns := &liveDNSConfig{
+		Key:    apiKey,
+		Zone:   zoneID,
+		Record: recordName,
 	}
 
-	//if we try to make a request before there is internet connectivity it will hang indefinitely.
-	//this is bad as this starts before my PPP connection is up.
-	//so we wait.
-	endpoint := platform.Url()
-	for {
-		//the default http.Get has a 30 second timeout.
-		if res, err := http.Get(endpoint); err == nil {
-			//OK that's what I hoped for
-			res.Close = true
-			res.Body.Close()
-			break
-		}
-		//otherwise wait and try again
-		fmt.Println("Warn: no outbound internet access, waiting to try again")
-		time.Sleep(30 * time.Second)
+	publicip := &publicIPResolver{
+		Hostname: hostname,
+		Server:   resolver,
 	}
 
-	// Get the active version of the zone
-	client := client.New(apiKey, platform)
-	zoneInfo, err := zone.New(client).Info(zoneId)
-	if err != nil {
-		log.Println("Error: could not get current zone version:", err)
-		return
-	}
+	var registeredIP, currentIP string
+	var err error
 
-	activeVersion := zoneInfo.Version
-
-	// Get registered ip address
-	recordInfo, err := getRecord(client, zoneId, activeVersion, recordName)
-	if err != nil {
-		log.Println("Error: could not get current record info:", err)
-		return
-	}
-	registeredIp := recordInfo.Value
-	log.Println("Info: current registered IP:", registeredIp)
-
-	for {
+	loop := func() {
 		// Get the current public address
-		currentIp, err := getPublicIP4()
+		currentIP, err = publicip.Resolve()
 		if err != nil {
 			log.Println("Error: failed to get pulic IP:", err)
-		} else if currentIp != registeredIp {
-			// Update Gandi record when IP changes
-			recordInfo.Value = currentIp
-			if newVersion, err := updateRecord(client, zoneId, activeVersion, recordInfo); err == nil {
-				activeVersion = newVersion
-				registeredIp = currentIp
-				log.Print("Info: updated Gandi records with IP:", currentIp)
+			return
+		}
+
+		if registeredIP == "" {
+			registeredIP, err = dyndns.Get()
+			if err != nil {
+				log.Println("Error: failed to to get current dyndns record:", err)
+				return
+			}
+
+			if registeredIP != currentIP {
+				if err = dyndns.Set(currentIP); err != nil {
+					log.Println("Error: updating DNS record:", err)
+					return
+				}
+				log.Print("Info: updated Gandi records with IP:", currentIP)
 			}
 		}
+	}
+
+	for {
+		loop()
 		time.Sleep(refresh)
 	}
 }
